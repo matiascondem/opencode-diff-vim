@@ -1,0 +1,33 @@
+{
+  "id": "review_mock",
+  "session_id": "ses_mock",
+  "repo_root": "/tmp",
+  "round": 1,
+  "files": [
+    {
+      "path": "app/models/user.rb",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "before": "class User\n  def name\n    @name\n  end\nend\n",
+      "after": "class User\n  def name\n    @name.strip\n  end\n\n  def admin?\n    role == :admin\n  end\nend\n"
+    },
+    {
+      "path": "README.md",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "before": "",
+      "after": "# Title\n\nHello world\n"
+    },
+    {
+      "path": "old.txt",
+      "status": "deleted",
+      "additions": 0,
+      "deletions": 1,
+      "before": "goodbye\n",
+      "after": ""
+    }
+  ],
+  "existing_findings": []
+}
