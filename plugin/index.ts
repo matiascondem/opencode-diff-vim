@@ -102,28 +102,6 @@ type RenderedFile = {
   after: string
 }
 
-function remap(item: Finding, file: RenderedFile) {
-  const txt = item.side === "deletions" ? file.before : file.after
-  if (!item.anchor.selected) return undefined
-  const index = txt.indexOf(item.anchor.selected)
-  if (index < 0) return undefined
-  const start = txt.slice(0, index).split("\n").length
-  return { start_line: start, end_line: start + Math.max(1, item.anchor.selected.split("\n").length) - 1 }
-}
-
-function reconcile(files: RenderedFile[], findings: Finding[]): Finding[] {
-  const now = Date.now()
-  const map = new Map(files.map((file) => [file.path, file]))
-  return findings.map((item) => {
-    if (item.status !== "open") return item
-    const file = map.get(item.file)
-    if (!file) return { ...item, status: "closed_auto", close_reason: "file_removed", closed_at: now, updated_at: now }
-    const next = remap(item, file)
-    if (!next) return { ...item, status: "closed_auto", close_reason: "anchor_missing", closed_at: now, updated_at: now }
-    return { ...item, start_line: next.start_line, end_line: next.end_line, updated_at: now }
-  })
-}
-
 type IncomingFinding = {
   id?: string
   file?: unknown
@@ -170,7 +148,18 @@ type Completed = {
   notes: string
   findings: Finding[]
   json_path: string
-  md_path: string
+}
+
+function approvalIntent(notes: string) {
+  const normalized = notes.trim().toLowerCase()
+  if (!normalized) return false
+  return (
+    normalized.includes("/pr") ||
+    normalized.includes("looks good") ||
+    normalized.includes("lgtm") ||
+    normalized.includes("approved") ||
+    normalized.includes("ship it")
+  )
 }
 
 function format(result: Completed): string {
@@ -184,6 +173,15 @@ function format(result: Completed): string {
   const rows = open.map((item) => `- ${item.file}:${item.start_line}-${item.end_line} — ${item.comment.replace(/\n/g, " ")}`)
   const findings = rows.length > 0 ? rows.join("\n") : "- No comments"
   const notes = result.notes ? result.notes : "(none)"
+  const workflow = approvalIntent(result.notes)
+    ? [
+      "The reviewer note indicates approval to continue after handling inline comments.",
+      "Address any inline comments first; then continue the user's requested workflow, including opening a PR when requested, without asking for another confirmation.",
+    ]
+    : [
+      "Use this review to propose and discuss a fix plan only.",
+      "Do not edit files yet.",
+    ]
   return [
     `# Diff Review (vim) — Round ${result.round}`,
     "",
@@ -196,31 +194,8 @@ function format(result: Completed): string {
     "## Comments",
     findings,
     "",
-    "Use this review to propose and discuss a fix plan only.",
-    "Do not edit files yet.",
-  ].join("\n")
-}
-
-function markdown(input: { session_id: string; round: number; notes: string; findings: Finding[]; filter?: string[]; base?: string }) {
-  const list = input.findings
-    .map((item) => `- [${item.status}] ${item.file}:${item.start_line}-${item.end_line} (${item.side}) — ${item.comment.replace(/\n/g, " ")}`)
-    .join("\n")
-  const notes = input.notes || "(none)"
-  const files = input.filter?.length ? input.filter.join(", ") : "all changed files"
-  const source = input.base ? `${input.base}...HEAD` : "working tree"
-  return [
-    `# Diff Review (vim) Round ${input.round}`,
-    "",
-    `- Session: ${input.session_id}`,
-    `- Diff source: ${source}`,
-    `- Scope: ${files}`,
-    `- Timestamp: ${new Date().toISOString()}`,
-    "",
-    "## Notes",
-    notes,
-    "",
-    "## Comments",
-    list || "- none",
+    "## Workflow instruction",
+    ...workflow,
   ].join("\n")
 }
 
@@ -488,8 +463,9 @@ const DiffVimPlugin = async (ctx: any) => {
           template: [
             `Call the ${name} tool exactly once.`,
             "Pass raw command arguments from $ARGUMENTS into the tool arg `raw`.",
-            "After the tool returns, propose and discuss a fix strategy.",
-            "Do not edit files yet.",
+            "After the tool returns, follow its workflow instruction.",
+            "Normally, propose and discuss a fix strategy without editing files.",
+            "If the reviewer note indicates approval, such as `looks good`, `LGTM`, `approved`, `ship it`, or `/pr`, address inline comments first and then continue the user's requested workflow, including opening a PR when requested, without asking for another confirmation.",
           ].join("\n"),
         },
       }
@@ -531,9 +507,7 @@ const DiffVimPlugin = async (ctx: any) => {
           const state_file = path.join(output_root, "state.json")
           const payload_file = path.join(output_root, "vim-payload.json")
           const state = await readState(state_file, context.sessionID)
-          const merged = reconcile(files, state.findings)
-          const existing = merged.filter((item) => item.status === "open")
-          const base: ReviewState = { ...state, findings: merged, updated_at: Date.now() }
+          const base: ReviewState = { ...state, findings: [], updated_at: Date.now() }
           await saveState(state_file, base)
 
           const id = `review_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 6)}`
@@ -545,7 +519,7 @@ const DiffVimPlugin = async (ctx: any) => {
             scope_root,
             round: base.round + 1,
             files,
-            existing_findings: existing,
+            existing_findings: [],
             draft: base.draft ?? { notes: "", new_findings: [] },
             filter: parsed.files,
             base: parsed.base,
@@ -584,32 +558,24 @@ const DiffVimPlugin = async (ctx: any) => {
                 const fresh = Array.isArray(input.new_findings) ? input.new_findings : []
                 const round = base.round + 1
                 const created = sanitize(fresh, round, fileMap)
-                const carry = base.findings.filter((item) => item.status === "open")
-                const findings = [
-                  ...base.findings.filter((item) => item.status !== "open"),
-                  ...carry,
-                  ...created,
-                ]
-                await saveState(state_file, { ...base, round, findings, draft: undefined, updated_at: Date.now() })
+                await saveState(state_file, { ...base, round, findings: [], draft: undefined, updated_at: Date.now() })
                 const stamp = String(round).padStart(3, "0")
                 const json_path = path.join(output_root, `round-${stamp}.json`)
-                const md_path = path.join(output_root, `round-${stamp}.md`)
                 await Bun.write(json_path, JSON.stringify({
                   session_id: context.sessionID,
                   round,
                   notes,
-                  findings,
+                  findings: created,
                   filter: parsed.files,
                   base: parsed.base,
                   generated_at: Date.now(),
                 }, null, 2))
-                await Bun.write(md_path, markdown({ session_id: context.sessionID, round, notes, findings, filter: parsed.files, base: parsed.base }))
-                queueMicrotask(() => resolveOnce({ cancelled: false, round, notes, findings, json_path, md_path }))
-                return new Response(JSON.stringify({ ok: true, round, json_path, md_path }), { headers: { "content-type": "application/json" } })
+                queueMicrotask(() => resolveOnce({ cancelled: false, round, notes, findings: created, json_path }))
+                return new Response(JSON.stringify({ ok: true, round, json_path }), { headers: { "content-type": "application/json" } })
               }
 
               if (request.method === "POST" && pathname === `/api/review/${id}/cancel`) {
-                queueMicrotask(() => resolveOnce({ cancelled: true, round: base.round + 1, notes: "", findings: base.findings, json_path: "", md_path: "" }))
+                queueMicrotask(() => resolveOnce({ cancelled: true, round: base.round + 1, notes: "", findings: [], json_path: "" }))
                 return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } })
               }
 
@@ -658,7 +624,7 @@ const DiffVimPlugin = async (ctx: any) => {
           }).catch(() => {})
 
           context.abort?.addEventListener("abort", () => {
-            resolveOnce({ cancelled: true, round: base.round + 1, notes: "", findings: base.findings, json_path: "", md_path: "" })
+            resolveOnce({ cancelled: true, round: base.round + 1, notes: "", findings: [], json_path: "" })
           }, { once: true })
 
           const result = await wait

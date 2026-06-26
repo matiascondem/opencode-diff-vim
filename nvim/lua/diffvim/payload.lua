@@ -36,18 +36,6 @@ function M.load()
   State.payload = decoded
   State.files = decoded.files or {}
 
-  -- Seed any pre-existing open findings from prior rounds so they stay visible.
-  for _, f in ipairs(decoded.existing_findings or {}) do
-    State.findings[#State.findings + 1] = {
-      id = f.id,
-      file = f.file,
-      side = f.side or "additions",
-      start_line = f.start_line,
-      end_line = f.end_line,
-      comment = f.comment or "",
-      existing = true,
-    }
-  end
   State.notes = (decoded.draft and decoded.draft.notes) or ""
   return decoded
 end

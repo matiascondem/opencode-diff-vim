@@ -43,6 +43,10 @@ local function push_file_header(lines, meta, file)
   meta[#meta + 1] = { kind = "blank" }
 end
 
+local function unified_line(old_no, new_no, prefix, text)
+  return string.format("%6s | %6s | %s%s", old_no or "", new_no or "", prefix, text or "")
+end
+
 local function build_unified(file)
   local unified = split_unified(file)
 
@@ -71,17 +75,17 @@ local function build_unified(file)
       new_ln = n or new_ln
       push(raw, { kind = "header" })
     elseif first == "+" then
-      push(raw, { kind = "add", side = "additions", file_line = new_ln })
+      push(unified_line(nil, new_ln, "+", raw:sub(2)), { kind = "add", side = "additions", file_line = new_ln })
       new_ln = new_ln + 1
     elseif first == "-" then
-      push(raw, { kind = "del", side = "deletions", file_line = old_ln })
+      push(unified_line(old_ln, nil, "-", raw:sub(2)), { kind = "del", side = "deletions", file_line = old_ln })
       old_ln = old_ln + 1
     else
       -- context line (leading space) or "\ No newline at end of file"
       if first == "\\" then
         push(raw, { kind = "note" })
       else
-        push(raw, { kind = "context", side = "additions", file_line = new_ln })
+        push(unified_line(old_ln, new_ln, " ", raw:sub(2)), { kind = "context", side = "additions", file_line = new_ln })
         old_ln = old_ln + 1
         new_ln = new_ln + 1
       end

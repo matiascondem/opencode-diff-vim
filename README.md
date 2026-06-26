@@ -96,7 +96,8 @@ Leader is `space`.
 | `a`            | diff, normal | comment the **current line**                      |
 | `v` then `a`   | diff, visual | comment the **selected line range**               |
 | `<leader>ss`   | anywhere     | toggle unified / side-by-side diff view           |
-| `<C-s>`        | input box    | save the comment / note                           |
+| `<CR>`         | input box    | save the comment / note                           |
+| `<S-CR>`/`<C-j>`| input box   | insert a newline                                  |
 | `q` / `<Esc>`  | input box    | cancel                                            |
 | `a`            | on a comment | edit it                                           |
 | `<leader>x`    | diff         | delete the comment under the cursor               |
@@ -122,16 +123,17 @@ Comments are intentionally minimal: just a message anchored to a line or range.
    │               tree │ unified diff · a / v+a comments · <leader>s note
    │               └─ <leader>y → curl POST /submit → :qa
    │
-   └─ await /submit ─▶ write round-NNN.{json,md} ─▶ return comments to the agent
+   └─ await /submit ─▶ write round-NNN.json ─▶ return comments to the agent
 ```
 
 - **Isolation:** the review runs under `NVIM_APPNAME=diff-vim`, so it never loads
   your daily config and writes its state to `~/.local/share/diff-vim`.
 - **Never hangs:** closing the tab without submitting posts a `cancel`, so the
   waiting tool always resolves.
-- **State & exports:** findings persist in
-  `.opencode/reviews/<session>/state.json`; each submit writes
-  `round-NNN.json` and `round-NNN.md`.
+- **State & exports:** internal round state lives in
+  `.opencode/reviews/<session>/state.json`; each submit writes one
+  `round-NNN.json` export. Prior submitted comments are not reloaded into the
+  next review.
 
 ---
 

@@ -8,6 +8,7 @@ local State = {
 
   payload = nil, -- decoded payload table
   files = {}, -- payload.files : { {path,status,additions,deletions,before,after}, ... }
+  tree_rows = {}, -- visible rows in the changed-files tree
 
   -- Findings the user creates this session: { {file, side, start_line, end_line, comment}, ... }
   findings = {},
@@ -26,6 +27,7 @@ local State = {
   -- namespaces
   ns_diff = nil, -- diff line highlights
   ns_comment = nil, -- inline comment extmarks
+  ns_tree = nil, -- changed-files tree highlights
 
   -- per-render bookkeeping for the file currently in the diff pane
   meta = {}, -- meta[bufline] = { kind = "add"|"del"|"context"|"header"|"title", side, file_line }
