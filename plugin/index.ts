@@ -1,32 +1,39 @@
 import { tool } from "@opencode-ai/plugin"
-import { mkdir, readdir } from "node:fs/promises"
+import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { fileURLToPath } from "node:url"
+import { tmpdir } from "node:os"
 import path from "node:path"
 
 // ---------------------------------------------------------------------------
 // opencode-diff-vim
 //
 // A fork of the data/transport layer of `opencode-diffs` that swaps the
-// browser + @pierre/diffs UI for a Neovim review app launched in a Kitty tab.
-// The git collection, state persistence, blocking handshake, and round exports
-// are kept; only the front-end and the comment schema (message-only) change.
+// browser + @pierre/diffs UI for a Neovim review app launched in a terminal.
+// The git collection and blocking handshake are kept; only the front-end and
+// the comment schema (message-only) change.
 // ---------------------------------------------------------------------------
 
 const command = "diff-vim"
 const name = "diff_vim"
 const sides = ["additions", "deletions"] as const
+const terminals = ["auto", "kitty", "wezterm"] as const
 
 type Side = (typeof sides)[number]
+type Terminal = (typeof terminals)[number]
 
-type Parsed = { files?: string[]; base?: string; error?: string }
+type Parsed = { files?: string[]; base?: string; terminal?: Terminal; error?: string }
 
 function usage() {
-  return "Usage: /diff-vim [--base origin/dev] [--files path/to/a.ts,path/to/b.ts]"
+  return "Usage: /diff-vim [--base origin/dev] [--files path/to/a.ts,path/to/b.ts] [--terminal auto|kitty|wezterm]"
 }
 
 function isSide(input: unknown): input is Side {
   return typeof input === "string" && (sides as readonly string[]).includes(input)
+}
+
+function isTerminal(input: unknown): input is Terminal {
+  return typeof input === "string" && (terminals as readonly string[]).includes(input)
 }
 
 function parse(raw: string | undefined): Parsed {
@@ -34,6 +41,7 @@ function parse(raw: string | undefined): Parsed {
   const tokens = raw.trim().split(/\s+/).filter(Boolean)
   let files: string[] | undefined
   let base: string | undefined
+  let terminal: Terminal | undefined
   for (let index = 0; index < tokens.length; index++) {
     const token = tokens[index]
     if (!token) continue
@@ -54,9 +62,17 @@ function parse(raw: string | undefined): Parsed {
       if (token === "--base") index++
       continue
     }
+    if (token === "--terminal" || token.startsWith("--terminal=")) {
+      const value = token.startsWith("--terminal=") ? token.slice(11) : next
+      if (!value || value.startsWith("--")) return { error: `--terminal expects one of: ${terminals.join(", ")}\n${usage()}` }
+      if (!isTerminal(value)) return { error: `Unsupported terminal: ${value}\n${usage()}` }
+      terminal = value
+      if (token === "--terminal") index++
+      continue
+    }
     return { error: `Unsupported argument: ${token}\n${usage()}` }
   }
-  return { files, base }
+  return { files, base, terminal }
 }
 
 // --- finding anchoring & reconciliation ------------------------------------
@@ -147,7 +163,6 @@ type Completed = {
   round: number
   notes: string
   findings: Finding[]
-  json_path: string
 }
 
 function approvalIntent(notes: string) {
@@ -176,17 +191,20 @@ function format(result: Completed): string {
   const workflow = approvalIntent(result.notes)
     ? [
       "The reviewer note indicates approval to continue after handling inline comments.",
-      "Address any inline comments first; then continue the user's requested workflow, including opening a PR when requested, without asking for another confirmation.",
+      "Address any clear inline comments directly; then continue the user's requested workflow, including opening a PR when requested, without asking for another confirmation.",
     ]
-    : [
-      "Use this review to propose and discuss a fix plan only.",
-      "Do not edit files yet.",
-    ]
+    : open.length > 0
+      ? [
+        "Treat clear inline comments as requested code changes and implement them directly.",
+        "Only stop to ask for clarification when a comment is ambiguous, conflicts with another request, or would require a high-risk/product decision.",
+      ]
+      : [
+        "No inline comments were submitted. Use the reviewer note as the next instruction if it is actionable; otherwise ask before editing.",
+      ]
   return [
     `# Diff Review (vim) — Round ${result.round}`,
     "",
     `- Comments: ${open.length}`,
-    `- JSON export: ${result.json_path}`,
     "",
     "## Reviewer note",
     notes,
@@ -197,31 +215,6 @@ function format(result: Completed): string {
     "## Workflow instruction",
     ...workflow,
   ].join("\n")
-}
-
-// --- state persistence ------------------------------------------------------
-
-type ReviewState = {
-  session_id: string
-  round: number
-  findings: Finding[]
-  draft?: { notes: string; new_findings: IncomingFinding[] }
-  updated_at: number
-}
-
-function defaultState(session_id: string): ReviewState {
-  return { session_id, round: 0, findings: [], updated_at: Date.now() }
-}
-
-async function readState(file: string, session_id: string): Promise<ReviewState> {
-  const source = Bun.file(file)
-  if (!(await source.exists())) return defaultState(session_id)
-  return source.json().catch(() => defaultState(session_id))
-}
-
-async function saveState(file: string, state: ReviewState) {
-  await mkdir(path.dirname(file), { recursive: true })
-  await Bun.write(file, JSON.stringify(state, null, 2))
 }
 
 // --- git plumbing (reused from opencode-diffs) ------------------------------
@@ -386,7 +379,7 @@ async function collect(root: string, dir: string, base?: string) {
   return collectWorking(root, dir)
 }
 
-// --- kitty + neovim launch --------------------------------------------------
+// --- terminal + neovim launch -----------------------------------------------
 
 // Resolve the repo root that contains nvim/init.lua, working for both the
 // local-dev shim (<repo>/plugin/index.ts) and a future npm install.
@@ -416,13 +409,31 @@ async function kittySocket(): Promise<string | undefined> {
   }
 }
 
-async function launchKitty(opts: {
+type LaunchOpts = {
   cwd: string
   init: string
   payloadFile: string
   submitUrl: string
   tabTitle: string
-}): Promise<{ ok: boolean; error?: string }> {
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`
+}
+
+function reviewEnv(opts: LaunchOpts) {
+  return {
+    DIFF_VIM_PAYLOAD: opts.payloadFile,
+    DIFF_VIM_SUBMIT_URL: opts.submitUrl,
+    NVIM_APPNAME: "diff-vim",
+  }
+}
+
+function envCommand(opts: LaunchOpts) {
+  return Object.entries(reviewEnv(opts)).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")
+}
+
+async function launchKitty(opts: LaunchOpts): Promise<{ ok: boolean; error?: string }> {
   const socket = await kittySocket()
   if (!socket) return { ok: false, error: "no kitty socket (KITTY_LISTEN_ON unset and no /tmp/kitty-*)" }
   const bin = Bun.which("kitty")
@@ -449,6 +460,33 @@ async function launchKitty(opts: {
   return { ok: true }
 }
 
+async function launchWezTerm(opts: LaunchOpts): Promise<{ ok: boolean; error?: string }> {
+  const bin = Bun.which("wezterm")
+  if (!bin) return { ok: false, error: "wezterm not found on PATH" }
+
+  const command = `${envCommand(opts)} nvim -u ${shellQuote(opts.init)}`
+  const args = ["cli", "spawn"]
+  if (!process.env.WEZTERM_PANE) args.push("--new-window")
+  args.push("--cwd", opts.cwd, "--", "sh", "-lc", command)
+  const proc = Bun.spawn([bin, ...args], { stdout: "pipe", stderr: "pipe" })
+  const [stderr, code] = await Promise.all([
+    Bun.readableStreamToText(proc.stderr).catch(() => ""),
+    proc.exited,
+  ])
+  if (code !== 0) return { ok: false, error: stderr.trim() || `wezterm cli spawn exited ${code}` }
+  return { ok: true }
+}
+
+async function launchReview(opts: LaunchOpts, terminal: Terminal = "auto"): Promise<{ ok: boolean; error?: string; terminal: Exclude<Terminal, "auto"> }> {
+  if (terminal === "wezterm" || (terminal === "auto" && process.env.WEZTERM_PANE)) {
+    const result = await launchWezTerm(opts)
+    return { ...result, terminal: "wezterm" }
+  }
+
+  const result = await launchKitty(opts)
+  return { ...result, terminal: "kitty" }
+}
+
 // --- plugin -----------------------------------------------------------------
 
 const DiffVimPlugin = async (ctx: any) => {
@@ -459,12 +497,13 @@ const DiffVimPlugin = async (ctx: any) => {
       output.command = {
         ...output.command,
         [command]: {
-          description: "Open a vim-native diff review in a Kitty tab and collect inline comments",
+          description: "Open a vim-native diff review in a terminal tab and collect inline comments",
           template: [
             `Call the ${name} tool exactly once.`,
             "Pass raw command arguments from $ARGUMENTS into the tool arg `raw`.",
             "After the tool returns, follow its workflow instruction.",
-            "Normally, propose and discuss a fix strategy without editing files.",
+            "Treat clear inline comments as requested code changes and implement them directly.",
+            "Only stop to ask for clarification when feedback is ambiguous, conflicts with another request, or would require a high-risk/product decision.",
             "If the reviewer note indicates approval, such as `looks good`, `LGTM`, `approved`, `ship it`, or `/pr`, address inline comments first and then continue the user's requested workflow, including opening a PR when requested, without asking for another confirmation.",
           ].join("\n"),
         },
@@ -473,7 +512,7 @@ const DiffVimPlugin = async (ctx: any) => {
     tool: {
       [name]: tool({
         description:
-          "Open a Neovim-based diff review in a new Kitty tab for the current session and return structured comments for proposal discussion.",
+          "Open a Neovim-based diff review in a new terminal tab for the current session and return structured comments for proposal discussion.",
         args: { raw: tool.schema.string().optional().describe("Raw command arguments from /diff-vim") },
         async execute(args: { raw?: string }, context: any) {
           if (!init) return "Failed to locate nvim/init.lua next to the plugin. Reinstall opencode-diff-vim."
@@ -503,12 +542,8 @@ const DiffVimPlugin = async (ctx: any) => {
           }
 
           const files = scoped
-          const output_root = path.join(scope_root, ".opencode", "reviews", context.sessionID)
-          const state_file = path.join(output_root, "state.json")
-          const payload_file = path.join(output_root, "vim-payload.json")
-          const state = await readState(state_file, context.sessionID)
-          const base: ReviewState = { ...state, findings: [], updated_at: Date.now() }
-          await saveState(state_file, base)
+          const temp_root = await mkdtemp(path.join(tmpdir(), "opencode-diff-vim-"))
+          const payload_file = path.join(temp_root, "vim-payload.json")
 
           const id = `review_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 6)}`
           const token = crypto.randomUUID().replaceAll("-", "")
@@ -517,14 +552,13 @@ const DiffVimPlugin = async (ctx: any) => {
             session_id: context.sessionID,
             repo_root: root.path,
             scope_root,
-            round: base.round + 1,
+            round: 1,
             files,
             existing_findings: [],
-            draft: base.draft ?? { notes: "", new_findings: [] },
+            draft: { notes: "", new_findings: [] },
             filter: parsed.files,
             base: parsed.base,
           }
-          await mkdir(output_root, { recursive: true })
           await Bun.write(payload_file, JSON.stringify(data, null, 2))
 
           const fileMap = new Map(files.map((item) => [item.path, item]))
@@ -556,26 +590,14 @@ const DiffVimPlugin = async (ctx: any) => {
                 const input = (await request.json().catch(() => ({}))) as any
                 const notes = typeof input.notes === "string" ? input.notes.trim() : ""
                 const fresh = Array.isArray(input.new_findings) ? input.new_findings : []
-                const round = base.round + 1
+                const round = 1
                 const created = sanitize(fresh, round, fileMap)
-                await saveState(state_file, { ...base, round, findings: [], draft: undefined, updated_at: Date.now() })
-                const stamp = String(round).padStart(3, "0")
-                const json_path = path.join(output_root, `round-${stamp}.json`)
-                await Bun.write(json_path, JSON.stringify({
-                  session_id: context.sessionID,
-                  round,
-                  notes,
-                  findings: created,
-                  filter: parsed.files,
-                  base: parsed.base,
-                  generated_at: Date.now(),
-                }, null, 2))
-                queueMicrotask(() => resolveOnce({ cancelled: false, round, notes, findings: created, json_path }))
-                return new Response(JSON.stringify({ ok: true, round, json_path }), { headers: { "content-type": "application/json" } })
+                queueMicrotask(() => resolveOnce({ cancelled: false, round, notes, findings: created }))
+                return new Response(JSON.stringify({ ok: true, round }), { headers: { "content-type": "application/json" } })
               }
 
               if (request.method === "POST" && pathname === `/api/review/${id}/cancel`) {
-                queueMicrotask(() => resolveOnce({ cancelled: true, round: base.round + 1, notes: "", findings: [], json_path: "" }))
+                queueMicrotask(() => resolveOnce({ cancelled: true, round: 1, notes: "", findings: [] }))
                 return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } })
               }
 
@@ -584,23 +606,24 @@ const DiffVimPlugin = async (ctx: any) => {
           })
 
           const submitUrl = `http://127.0.0.1:${server.port}/api/review/${id}/submit?token=${token}`
-          const launched = await launchKitty({
+          const launched = await launchReview({
             cwd: root.path,
             init,
             payloadFile: payload_file,
             submitUrl,
             tabTitle: "diff-vim · review",
-          })
+          }, parsed.terminal ?? "auto")
           if (!launched.ok) {
             server.stop(true)
+            await rm(temp_root, { recursive: true, force: true }).catch(() => {})
             return [
-              "Failed to open the Neovim review tab in Kitty.",
+              `Failed to open the Neovim review tab in ${launched.terminal}.`,
               `Reason: ${launched.error}`,
               "",
               "Checklist:",
-              "- Kitty must have `allow_remote_control yes` and a `listen_on` socket.",
-              "- This opencode session must run inside that Kitty (KITTY_LISTEN_ON set).",
-              "- `kitty` and `nvim` must be on PATH.",
+              "- For Kitty, enable `allow_remote_control yes` and configure a `listen_on` socket.",
+              "- For WezTerm, run opencode inside WezTerm so `WEZTERM_PANE` is available, or pass `--terminal wezterm`.",
+              "- `nvim` and the selected terminal CLI must be on PATH.",
             ].join("\n")
           }
 
@@ -624,11 +647,13 @@ const DiffVimPlugin = async (ctx: any) => {
           }).catch(() => {})
 
           context.abort?.addEventListener("abort", () => {
-            resolveOnce({ cancelled: true, round: base.round + 1, notes: "", findings: [], json_path: "" })
+            resolveOnce({ cancelled: true, round: 1, notes: "", findings: [] })
           }, { once: true })
 
           const result = await wait
-          setTimeout(() => server.stop(true), 150)
+          await new Promise((resolve) => setTimeout(resolve, 150))
+          server.stop(true)
+          await rm(temp_root, { recursive: true, force: true }).catch(() => {})
           return format(result)
         },
       }),

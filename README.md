@@ -2,17 +2,17 @@
 
 A keyboard-only, **vim-native diff review** for [opencode](https://opencode.ai).
 
-When an agent finishes work, run `/diff-vim`. It opens a **new Kitty tab** right
-next to your chat with a two-pane review UI rendered in **Neovim**: a changed-files
-tree on the left, a unified GitHub-style diff on the right. You move with real vim
-motions, drop inline comments on lines or ranges (non-destructively), write one
-final review note, and submit — the structured comments flow straight back into
-the opencode session for the agent to act on.
+When an agent finishes work, run `/diff-vim`. It opens a terminal tab right next
+to your chat with a two-pane review UI rendered in **Neovim**: a changed-files
+tree on the left, a unified GitHub-style diff on the right. You move with real
+vim motions, drop inline comments on lines or ranges (non-destructively), write
+one final review note, and submit — the structured comments flow straight back
+into the opencode session for the agent to act on.
 
 It's a focused reimagining of the excellent
 [`opencode-diffs`](https://github.com/oorestisime/opencode-diffs) plugin: the git
-collection, blocking handshake, and round exports are kept; the browser +
-`@pierre/diffs` front-end is replaced with Neovim.
+collection and blocking handshake are kept; the browser + `@pierre/diffs`
+front-end is replaced with Neovim.
 
 ---
 
@@ -29,10 +29,10 @@ collection, blocking handshake, and round exports are kept; the browser +
 
 ## Requirements
 
-- **Kitty** with remote control enabled (see below).
+- **Kitty** with remote control enabled, or **WezTerm** with its CLI on PATH.
 - **Neovim ≥ 0.10** (uses `vim.system`, `vim.diff`, extmark `virt_lines`).
 - **curl** (submits the review back to opencode).
-- **opencode** running *inside* Kitty (so the plugin can find the Kitty socket).
+- **opencode** running *inside* Kitty or WezTerm.
 - A **Nerd Font** is optional — only used for the tree status glyphs.
 
 ### Kitty setup
@@ -48,6 +48,12 @@ Kitty exposes a per-window socket as `$KITTY_LISTEN_ON` (e.g.
 `unix:/tmp/kitty-40543`). The plugin reads that env var to open the review tab in
 the **same** OS window as your opencode session. Fully restart Kitty after
 changing the config.
+
+### WezTerm setup
+
+WezTerm works through `wezterm cli spawn`. If opencode is already running inside
+WezTerm, `/diff-vim --terminal wezterm` opens the review in a new tab in the same
+window. Outside WezTerm, it falls back to a new WezTerm window.
 
 ---
 
@@ -78,10 +84,13 @@ In opencode:
 /diff-vim                          # review the working-tree diff (vs HEAD)
 /diff-vim --base origin/dev        # review this branch vs its merge-base with origin/dev
 /diff-vim --files a.ts,b.ts        # only these files
+/diff-vim --terminal wezterm       # force WezTerm instead of auto-detection
+/diff-vim --terminal kitty         # force Kitty instead of auto-detection
 ```
 
-A Kitty tab opens with the review. When you submit, opencode receives the
-comments and you continue the conversation.
+A terminal tab opens with the review. When you submit, opencode receives the
+comments and you continue the conversation. `--terminal auto` is the default: it
+uses WezTerm when `WEZTERM_PANE` is present, otherwise Kitty.
 
 ### Keybindings
 
@@ -114,26 +123,25 @@ Comments are intentionally minimal: just a message anchored to a line or range.
 ```
 /diff-vim ─▶ diff_vim tool (plugin/index.ts)
    ├─ collect git diff (working tree vs HEAD, or --base ref)
-   ├─ write payload to .opencode/reviews/<session>/vim-payload.json
+   ├─ write payload to a temporary OS directory
    ├─ start a local 127.0.0.1 server (random port + token)
-   ├─ kitty @ launch --type=tab … nvim -u nvim/init.lua
+   ├─ launch Kitty/WezTerm tab … nvim -u nvim/init.lua
    │        env: DIFF_VIM_PAYLOAD, DIFF_VIM_SUBMIT_URL, NVIM_APPNAME=diff-vim
    │            │
    │            └─ Neovim review app (nvim/lua/diffvim/*)
    │               tree │ unified diff · a / v+a comments · <leader>s note
    │               └─ <leader>y → curl POST /submit → :qa
    │
-   └─ await /submit ─▶ write round-NNN.json ─▶ return comments to the agent
+   └─ await /submit ─▶ remove temporary files ─▶ return comments to the agent
 ```
 
 - **Isolation:** the review runs under `NVIM_APPNAME=diff-vim`, so it never loads
   your daily config and writes its state to `~/.local/share/diff-vim`.
 - **Never hangs:** closing the tab without submitting posts a `cancel`, so the
   waiting tool always resolves.
-- **State & exports:** internal round state lives in
-  `.opencode/reviews/<session>/state.json`; each submit writes one
-  `round-NNN.json` export. Prior submitted comments are not reloaded into the
-  next review.
+- **Ephemeral review data:** payload files live in the OS temp directory only
+  while the review is open, then are removed after submit/cancel. Comments are
+  returned directly to opencode and are not written into the reviewed repo.
 
 ---
 

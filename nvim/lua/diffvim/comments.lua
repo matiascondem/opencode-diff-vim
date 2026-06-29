@@ -4,7 +4,7 @@ local State = require("diffvim.state")
 
 local M = {}
 
--- A centered floating input. Calls cb(text) on <C-s>, cb(nil) on cancel.
+-- A centered floating input. Calls cb(text) on Enter, cb(nil) on cancel.
 function M.input(opts, default, cb)
   local width = opts.width or 66
   local seed = {}

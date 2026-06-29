@@ -1,7 +1,7 @@
 {
   "name": "opencode-diff-vim",
   "version": "0.1.0",
-  "description": "Keyboard-only, vim-native diff review for OpenCode, rendered in a Kitty tab with Neovim",
+  "description": "Keyboard-only, vim-native diff review for OpenCode, rendered in a terminal tab with Neovim",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -11,6 +11,7 @@
     "code-review",
     "neovim",
     "kitty",
+    "wezterm",
     "vim"
   ],
   "main": "./plugin/index.ts",

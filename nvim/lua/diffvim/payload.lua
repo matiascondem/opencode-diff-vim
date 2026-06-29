@@ -13,7 +13,7 @@ local function read_file(path)
   return data
 end
 
--- Populate State.cfg from the environment the plugin set on the kitty tab.
+-- Populate State.cfg from the environment the plugin set on the review process.
 function M.load_cfg()
   State.cfg.payload_file = vim.env.DIFF_VIM_PAYLOAD
   State.cfg.submit_url = vim.env.DIFF_VIM_SUBMIT_URL

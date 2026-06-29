@@ -42,8 +42,10 @@ fi
 
 if command -v kitty >/dev/null 2>&1; then
   ok "kitty on PATH"
+elif command -v wezterm >/dev/null 2>&1; then
+  ok "wezterm on PATH"
 else
-  warn "kitty not found on PATH — the review tab cannot be launched"
+  warn "neither kitty nor wezterm found on PATH — the review tab cannot be launched"
 fi
 
 if command -v curl >/dev/null 2>&1; then
@@ -62,7 +64,13 @@ fi
 if [ -n "${KITTY_LISTEN_ON:-}" ]; then
   ok "KITTY_LISTEN_ON=$KITTY_LISTEN_ON"
 else
-  warn "KITTY_LISTEN_ON is empty in this shell — run opencode inside kitty so the plugin can find the socket"
+  warn "KITTY_LISTEN_ON is empty in this shell — run opencode inside kitty, or use /diff-vim --terminal wezterm"
+fi
+
+if [ -n "${WEZTERM_PANE:-}" ]; then
+  ok "WEZTERM_PANE=$WEZTERM_PANE"
+elif command -v wezterm >/dev/null 2>&1; then
+  warn "WEZTERM_PANE is empty — /diff-vim --terminal wezterm will open a new WezTerm window instead of a same-window tab"
 fi
 
 echo
