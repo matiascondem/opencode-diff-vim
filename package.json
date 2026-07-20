@@ -1,7 +1,7 @@
 {
   "name": "opencode-diff-vim",
-  "version": "0.1.0",
-  "description": "Keyboard-only, vim-native diff review for OpenCode, rendered in a terminal tab with Neovim",
+  "version": "0.2.0",
+  "description": "Fast keyboard-only Neovim diff review for the OpenCode TUI",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -14,25 +14,31 @@
     "wezterm",
     "vim"
   ],
-  "main": "./plugin/index.ts",
   "exports": {
-    ".": "./plugin/index.ts"
+    "./tui": "./tui/index.ts"
   },
   "files": [
     "plugin",
+    "tui",
     "nvim",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "engines": {
+    "opencode": ">=1.18.3"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "1.14.28"
+    "@opencode-ai/plugin": "1.18.3"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",
     "@types/node": "^26.0.1",
+    "tsx": "^4.20.6",
     "typescript": "^5.8.3"
   }
 }

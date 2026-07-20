@@ -11,5 +11,5 @@
     "esModuleInterop": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["plugin/**/*.ts"]
+  "include": ["plugin/**/*.ts", "tui/**/*.ts", "test/**/*.ts"]
 }

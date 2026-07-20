@@ -1,4 +1,3 @@
-import { tool } from "@opencode-ai/plugin"
 import { mkdtemp, readdir, rm } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { fileURLToPath } from "node:url"
@@ -8,71 +7,17 @@ import path from "node:path"
 // ---------------------------------------------------------------------------
 // opencode-diff-vim
 //
-// A fork of the data/transport layer of `opencode-diffs` that swaps the
-// browser + @pierre/diffs UI for a Neovim review app launched in a terminal.
-// The git collection and blocking handshake are kept; only the front-end and
-// the comment schema (message-only) change.
+// Collects working-tree changes, launches the isolated Neovim review app, and
+// returns submitted feedback to the direct TUI command.
 // ---------------------------------------------------------------------------
 
-const command = "diff-vim"
-const name = "diff_vim"
 const sides = ["additions", "deletions"] as const
-const terminals = ["auto", "kitty", "wezterm"] as const
 
 type Side = (typeof sides)[number]
-type Terminal = (typeof terminals)[number]
-
-type Parsed = { files?: string[]; base?: string; terminal?: Terminal; error?: string }
-
-function usage() {
-  return "Usage: /diff-vim [--base origin/dev] [--files path/to/a.ts,path/to/b.ts] [--terminal auto|kitty|wezterm]"
-}
+type Terminal = "auto" | "kitty" | "wezterm"
 
 function isSide(input: unknown): input is Side {
   return typeof input === "string" && (sides as readonly string[]).includes(input)
-}
-
-function isTerminal(input: unknown): input is Terminal {
-  return typeof input === "string" && (terminals as readonly string[]).includes(input)
-}
-
-function parse(raw: string | undefined): Parsed {
-  if (!raw?.trim()) return {}
-  const tokens = raw.trim().split(/\s+/).filter(Boolean)
-  let files: string[] | undefined
-  let base: string | undefined
-  let terminal: Terminal | undefined
-  for (let index = 0; index < tokens.length; index++) {
-    const token = tokens[index]
-    if (!token) continue
-    const next = tokens[index + 1]
-    if (token === "--files" || token.startsWith("--files=")) {
-      const value = token.startsWith("--files=") ? token.slice(8) : next
-      if (!value || value.startsWith("--")) return { error: `--files expects a comma-separated list.\n${usage()}` }
-      const parsed = value.split(",").map((item) => item.trim()).filter(Boolean)
-      if (parsed.length === 0) return { error: `--files expects a comma-separated list.\n${usage()}` }
-      files = parsed
-      if (token === "--files") index++
-      continue
-    }
-    if (token === "--base" || token.startsWith("--base=")) {
-      const value = token.startsWith("--base=") ? token.slice(7) : next
-      if (!value || value.startsWith("--")) return { error: `--base expects a branch, tag, or ref name.\n${usage()}` }
-      base = value
-      if (token === "--base") index++
-      continue
-    }
-    if (token === "--terminal" || token.startsWith("--terminal=")) {
-      const value = token.startsWith("--terminal=") ? token.slice(11) : next
-      if (!value || value.startsWith("--")) return { error: `--terminal expects one of: ${terminals.join(", ")}\n${usage()}` }
-      if (!isTerminal(value)) return { error: `Unsupported terminal: ${value}\n${usage()}` }
-      terminal = value
-      if (token === "--terminal") index++
-      continue
-    }
-    return { error: `Unsupported argument: ${token}\n${usage()}` }
-  }
-  return { files, base, terminal }
 }
 
 // --- finding anchoring & reconciliation ------------------------------------
@@ -179,10 +124,7 @@ function approvalIntent(notes: string) {
 
 function format(result: Completed): string {
   if (result.cancelled) {
-    return [
-      "Diff review was closed before submission.",
-      `You can relaunch with /${command}.`,
-    ].join("\n")
+    return "Diff review was closed before submission."
   }
   const open = result.findings.filter((item) => item.status === "open")
   const rows = open.map((item) => `- ${item.file}:${item.start_line}-${item.end_line} — ${item.comment.replace(/\n/g, " ")}`)
@@ -317,14 +259,6 @@ async function workingAfter(root: string, file: string) {
   return source.text().then(textOf).catch(() => "")
 }
 
-async function merge(root: string, base: string) {
-  const result = await run(root, ["git", "merge-base", base, "HEAD"])
-  if (!result.ok) return { rev: "", error: result.stderr.trim() || `failed to resolve merge-base for ${base}` }
-  const rev = result.stdout.trim()
-  if (!rev) return { rev: "", error: `failed to resolve merge-base for ${base}` }
-  return { rev, error: undefined as string | undefined }
-}
-
 async function collectWorking(root: string, dir: string) {
   const area = scope(root, dir)
   const withHead = await head(root)
@@ -348,41 +282,9 @@ async function collectWorking(root: string, dir: string) {
   return { files, error: undefined as string | undefined }
 }
 
-async function collectBase(root: string, dir: string, base: string) {
-  const area = scope(root, dir)
-  const merged = await merge(root, base)
-  if (merged.error) return { files: [] as RenderedFile[], error: `Failed to resolve --base ${base}: ${merged.error}` }
-  const listed = await run(root, ["git", "diff", "--name-only", "--no-renames", `${merged.rev}..HEAD`, "--", area])
-  if (!listed.ok) return { files: [] as RenderedFile[], error: `Failed to read git diff for --base ${base}` }
-  const fileNames = split(listed.stdout).filter((item) => !internal(item))
-  if (fileNames.length === 0) return { files: [] as RenderedFile[], error: undefined as string | undefined }
-  const map = await numstat(root, [`${merged.rev}..HEAD`], area)
-  const files = await Promise.all(fileNames.map(async (file): Promise<RenderedFile> => {
-    const prev = await showAt(root, merged.rev, file)
-    const next = await showAt(root, "HEAD", file)
-    const stat = map.get(file)
-    return {
-      path: file,
-      status: prev && !next ? "deleted" : !prev && next ? "added" : "modified",
-      before: prev,
-      after: next,
-      additions: stat?.additions ?? (prev ? Math.max(0, count(next) - count(prev)) : count(next)),
-      deletions: stat?.deletions ?? Math.max(0, count(prev) - count(next)),
-    }
-  }))
-  return { files, error: undefined as string | undefined }
-}
-
-async function collect(root: string, dir: string, base?: string) {
-  if (!(await inside(root))) return { files: [] as RenderedFile[], error: "Current directory is not a git repository." }
-  if (base) return collectBase(root, dir, base)
-  return collectWorking(root, dir)
-}
-
 // --- terminal + neovim launch -----------------------------------------------
 
-// Resolve the repo root that contains nvim/init.lua, working for both the
-// local-dev shim (<repo>/plugin/index.ts) and a future npm install.
+// Resolve the repo root that contains nvim/init.lua for local and npm installs.
 function findNvimInit(): string | undefined {
   let dir = path.dirname(fileURLToPath(import.meta.url))
   for (let i = 0; i < 6; i++) {
@@ -487,178 +389,141 @@ async function launchReview(opts: LaunchOpts, terminal: Terminal = "auto"): Prom
   return { ...result, terminal: "kitty" }
 }
 
-// --- plugin -----------------------------------------------------------------
+// --- review runner -----------------------------------------------------------
 
-const DiffVimPlugin = async (ctx: any) => {
-  const init = findNvimInit()
-  return {
-    config: async (output: any) => {
-      if (output.command?.[command]) return
-      output.command = {
-        ...output.command,
-        [command]: {
-          description: "Open a vim-native diff review in a terminal tab and collect inline comments",
-          template: [
-            `Call the ${name} tool exactly once.`,
-            "Pass raw command arguments from $ARGUMENTS into the tool arg `raw`.",
-            "After the tool returns, follow its workflow instruction.",
-            "Treat clear inline comments as requested code changes and implement them directly.",
-            "Only stop to ask for clarification when feedback is ambiguous, conflicts with another request, or would require a high-risk/product decision.",
-            "If the reviewer note indicates approval, such as `looks good`, `LGTM`, `approved`, `ship it`, or `/pr`, address inline comments first and then continue the user's requested workflow, including opening a PR when requested, without asking for another confirmation.",
-          ].join("\n"),
-        },
-      }
-    },
-    tool: {
-      [name]: tool({
-        description:
-          "Open a Neovim-based diff review in a new terminal tab for the current session and return structured comments for proposal discussion.",
-        args: { raw: tool.schema.string().optional().describe("Raw command arguments from /diff-vim") },
-        async execute(args: { raw?: string }, context: any) {
-          if (!init) return "Failed to locate nvim/init.lua next to the plugin. Reinstall opencode-diff-vim."
-          const parsed = parse(args.raw)
-          if (parsed.error) return parsed.error
+export type ReviewOutcome =
+  | { status: "submitted"; prompt: string }
+  | { status: "cancelled" }
+  | { status: "notice"; message: string }
+  | { status: "error"; message: string }
 
-          const roots = [context.worktree, context.directory].filter(Boolean) as string[]
-          const root = (await Promise.all(roots.map((item) => repo(item)))).find((item) => !item.error)
-          if (!root?.path) {
-            return ["Failed to resolve git repository root for this session.", `worktree=${context.worktree}`, `directory=${context.directory}`].join("\n")
-          }
-          const scope_root = context.worktree || context.directory
-          const source = await collect(root.path, scope_root, parsed.base)
-          if (source.error) return source.error
-
-          const all = source.files
-          const scoped = parsed.files?.length
-            ? all.filter((item) => parsed.files?.includes(item.path) || parsed.files?.some((value) => item.path.endsWith(value)))
-            : all
-          if (scoped.length === 0) {
-            const available = all.map((item) => `- ${item.path}`).join("\n")
-            return parsed.files?.length
-              ? ["No files matched --files filter.", "", usage(), "", "Available files:", available || "- none"].join("\n")
-              : parsed.base
-                ? `No changes found for --base ${parsed.base}.`
-                : "No git working-tree changes found yet."
-          }
-
-          const files = scoped
-          const temp_root = await mkdtemp(path.join(tmpdir(), "opencode-diff-vim-"))
-          const payload_file = path.join(temp_root, "vim-payload.json")
-
-          const id = `review_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 6)}`
-          const token = crypto.randomUUID().replaceAll("-", "")
-          const data = {
-            id,
-            session_id: context.sessionID,
-            repo_root: root.path,
-            scope_root,
-            round: 1,
-            files,
-            existing_findings: [],
-            draft: { notes: "", new_findings: [] },
-            filter: parsed.files,
-            base: parsed.base,
-          }
-          await Bun.write(payload_file, JSON.stringify(data, null, 2))
-
-          const fileMap = new Map(files.map((item) => [item.path, item]))
-          let done = false
-          let finish: (value: Completed) => void = () => {}
-          const wait = new Promise<Completed>((resolve) => {
-            finish = resolve
-          })
-          const resolveOnce = (result: Completed) => {
-            if (done) return
-            done = true
-            finish(result)
-          }
-
-          const server = Bun.serve({
-            port: 0,
-            hostname: "127.0.0.1",
-            fetch: async (request) => {
-              const url = new URL(request.url)
-              const pathname = url.pathname
-              if (pathname === "/health") return new Response("ok")
-              if (url.searchParams.get("token") !== token) return new Response("unauthorized", { status: 401 })
-
-              if (request.method === "GET" && pathname === `/api/review/${id}`) {
-                return new Response(JSON.stringify(data), { headers: { "content-type": "application/json" } })
-              }
-
-              if (request.method === "POST" && pathname === `/api/review/${id}/submit`) {
-                const input = (await request.json().catch(() => ({}))) as any
-                const notes = typeof input.notes === "string" ? input.notes.trim() : ""
-                const fresh = Array.isArray(input.new_findings) ? input.new_findings : []
-                const round = 1
-                const created = sanitize(fresh, round, fileMap)
-                queueMicrotask(() => resolveOnce({ cancelled: false, round, notes, findings: created }))
-                return new Response(JSON.stringify({ ok: true, round }), { headers: { "content-type": "application/json" } })
-              }
-
-              if (request.method === "POST" && pathname === `/api/review/${id}/cancel`) {
-                queueMicrotask(() => resolveOnce({ cancelled: true, round: 1, notes: "", findings: [] }))
-                return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } })
-              }
-
-              return new Response("not found", { status: 404 })
-            },
-          })
-
-          const submitUrl = `http://127.0.0.1:${server.port}/api/review/${id}/submit?token=${token}`
-          const launched = await launchReview({
-            cwd: root.path,
-            init,
-            payloadFile: payload_file,
-            submitUrl,
-            tabTitle: "diff-vim · review",
-          }, parsed.terminal ?? "auto")
-          if (!launched.ok) {
-            server.stop(true)
-            await rm(temp_root, { recursive: true, force: true }).catch(() => {})
-            return [
-              `Failed to open the Neovim review tab in ${launched.terminal}.`,
-              `Reason: ${launched.error}`,
-              "",
-              "Checklist:",
-              "- For Kitty, enable `allow_remote_control yes` and configure a `listen_on` socket.",
-              "- For WezTerm, run opencode inside WezTerm so `WEZTERM_PANE` is available, or pass `--terminal wezterm`.",
-              "- `nvim` and the selected terminal CLI must be on PATH.",
-            ].join("\n")
-          }
-
-          context.metadata?.({
-            title: "Diff review (vim)",
-            metadata: {
-              files: files.length,
-              scope: parsed.files?.length ? parsed.files.join(",") : "all",
-              base: parsed.base || "working_tree",
-              repo: root.path,
-            },
-          })
-          await ctx.client.app.log({
-            body: {
-              service: "diff-vim",
-              level: "info",
-              message: `vim review launched for ${context.sessionID}`,
-              extra: { files: files.length, base: parsed.base || "working_tree", repo: root.path },
-            },
-            query: { directory: context.directory },
-          }).catch(() => {})
-
-          context.abort?.addEventListener("abort", () => {
-            resolveOnce({ cancelled: true, round: 1, notes: "", findings: [] })
-          }, { once: true })
-
-          const result = await wait
-          await new Promise((resolve) => setTimeout(resolve, 150))
-          server.stop(true)
-          await rm(temp_root, { recursive: true, force: true }).catch(() => {})
-          return format(result)
-        },
-      }),
-    },
-  }
+export type ReviewInput = {
+  worktree?: string
+  directory: string
+  sessionID: string
+  signal?: AbortSignal
 }
 
-export { DiffVimPlugin, DiffVimPlugin as default }
+export async function runReview(input: ReviewInput): Promise<ReviewOutcome> {
+  const init = findNvimInit()
+  if (!init) {
+    return { status: "error", message: "Failed to locate nvim/init.lua next to the plugin. Reinstall opencode-diff-vim." }
+  }
+
+  const roots = [input.worktree, input.directory].filter(Boolean) as string[]
+  const root = (await Promise.all(roots.map((item) => repo(item)))).find((item) => !item.error)
+  if (!root?.path) {
+    return {
+      status: "error",
+      message: ["Failed to resolve git repository root for this session.", `worktree=${input.worktree}`, `directory=${input.directory}`].join("\n"),
+    }
+  }
+  if (!(await inside(root.path))) {
+    return { status: "error", message: "Current directory is not a git repository." }
+  }
+
+  const scopeRoot = input.worktree || input.directory
+  const source = await collectWorking(root.path, scopeRoot)
+  if (source.error) return { status: "error", message: source.error }
+  if (source.files.length === 0) {
+    return { status: "notice", message: "No git working-tree changes found yet." }
+  }
+
+  const files = source.files
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "opencode-diff-vim-"))
+  const payloadFile = path.join(tempRoot, "vim-payload.json")
+  const id = `review_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 6)}`
+  const token = crypto.randomUUID().replaceAll("-", "")
+  const data = {
+    id,
+    session_id: input.sessionID,
+    repo_root: root.path,
+    scope_root: scopeRoot,
+    round: 1,
+    files,
+    existing_findings: [],
+    draft: { notes: "", new_findings: [] },
+  }
+  await Bun.write(payloadFile, JSON.stringify(data, null, 2))
+
+  const fileMap = new Map(files.map((item) => [item.path, item]))
+  let done = false
+  let finish: (value: Completed) => void = () => {}
+  const wait = new Promise<Completed>((resolve) => {
+    finish = resolve
+  })
+  const resolveOnce = (result: Completed) => {
+    if (done) return
+    done = true
+    finish(result)
+  }
+
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch: async (request) => {
+      const url = new URL(request.url)
+      const pathname = url.pathname
+      if (pathname === "/health") return new Response("ok")
+      if (url.searchParams.get("token") !== token) return new Response("unauthorized", { status: 401 })
+
+      if (request.method === "GET" && pathname === `/api/review/${id}`) {
+        return new Response(JSON.stringify(data), { headers: { "content-type": "application/json" } })
+      }
+
+      if (request.method === "POST" && pathname === `/api/review/${id}/submit`) {
+        const body = (await request.json().catch(() => ({}))) as any
+        const notes = typeof body.notes === "string" ? body.notes.trim() : ""
+        const fresh = Array.isArray(body.new_findings) ? body.new_findings : []
+        const round = 1
+        const created = sanitize(fresh, round, fileMap)
+        queueMicrotask(() => resolveOnce({ cancelled: false, round, notes, findings: created }))
+        return new Response(JSON.stringify({ ok: true, round }), { headers: { "content-type": "application/json" } })
+      }
+
+      if (request.method === "POST" && pathname === `/api/review/${id}/cancel`) {
+        queueMicrotask(() => resolveOnce({ cancelled: true, round: 1, notes: "", findings: [] }))
+        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } })
+      }
+
+      return new Response("not found", { status: 404 })
+    },
+  })
+
+  const submitUrl = `http://127.0.0.1:${server.port}/api/review/${id}/submit?token=${token}`
+  const launched = await launchReview({
+    cwd: root.path,
+    init,
+    payloadFile,
+    submitUrl,
+    tabTitle: "diff-vim · review",
+  })
+  if (!launched.ok) {
+    server.stop(true)
+    await rm(tempRoot, { recursive: true, force: true }).catch(() => {})
+    return {
+      status: "error",
+      message: [
+        `Failed to open the Neovim review tab in ${launched.terminal}.`,
+        `Reason: ${launched.error}`,
+        "",
+        "Checklist:",
+        "- For Kitty, enable `allow_remote_control yes` and configure a `listen_on` socket.",
+        "- For WezTerm, run opencode inside WezTerm so `WEZTERM_PANE` is available.",
+        "- `nvim` and the selected terminal CLI must be on PATH.",
+      ].join("\n"),
+    }
+  }
+
+  const cancel = () => resolveOnce({ cancelled: true, round: 1, notes: "", findings: [] })
+  if (input.signal?.aborted) cancel()
+  else input.signal?.addEventListener("abort", cancel, { once: true })
+
+  const result = await wait
+  input.signal?.removeEventListener("abort", cancel)
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  server.stop(true)
+  await rm(tempRoot, { recursive: true, force: true }).catch(() => {})
+  if (result.cancelled) return { status: "cancelled" }
+  return { status: "submitted", prompt: format(result) }
+}
